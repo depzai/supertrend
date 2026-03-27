@@ -1,8 +1,11 @@
 """
 Supertrend Screener + Alpaca Paper Trading Engine
 ==================================================
-Screens 500 stocks from NASDAQ-100 + S&P 500 for Supertrend buy signals,
-then places bracket orders (entry + stop loss + take profit) on Alpaca paper.
+Screens 500 stocks from NASDAQ-100 + S&P 500 for Supertrend buy signals.
+Signal: stock is in Supertrend UPTREND on the latest daily bar (trend == 1),
+        regardless of when it flipped -- so you always get results.
+
+Places bracket orders (entry + stop loss + take profit) on Alpaca paper.
 Logs all signals and orders to Google Sheets ("ranging" / supertrend_signals + supertrend_orders).
 
 Setup:
@@ -16,7 +19,6 @@ GitHub Actions secrets required:
 """
 
 import os
-import json
 import time
 import tempfile
 import logging
@@ -40,12 +42,12 @@ except ImportError:
     raise ImportError("Run: pip install gspread google-auth")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 # CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 
-ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY",    "YOUR_PAPER_API_KEY")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "YOUR_PAPER_SECRET_KEY")
+ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY",    "")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 ALPACA_BASE_URL   = os.getenv("ALPACA_BASE_URL",   "https://paper-api.alpaca.markets")
 
 # Google Sheets
@@ -53,10 +55,10 @@ GSHEET_NAME  = "ranging"
 SIGNALS_TAB  = "supertrend_signals"
 ORDERS_TAB   = "supertrend_orders"
 
-# Strategy
-ATR_PERIOD       = 10
-MULTIPLIER       = 3.0
-VOL_MA_PERIOD    = 20
+# Supertrend params
+ATR_PERIOD    = 10
+MULTIPLIER    = 3.0
+VOL_MA_PERIOD = 20
 
 # Risk management
 RISK_PER_TRADE_PCT = 0.01
@@ -68,6 +70,9 @@ MIN_AVG_VOLUME     = 500_000
 
 LOOKBACK_DAYS = 120
 
+# Signal mode: "uptrend_today" = any stock in uptrend on latest bar
+SIGNAL_MODE = "uptrend_today"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -76,9 +81,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 # GOOGLE SHEETS
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -87,7 +92,8 @@ SCOPES = [
 
 SIGNALS_HEADERS = [
     "run_timestamp", "signal_date", "ticker", "close", "atr",
-    "supertrend", "stop", "target", "risk_per_share",
+    "supertrend", "trend_bars",  # how many bars since flip
+    "stop", "target", "risk_per_share",
 ]
 
 ORDERS_HEADERS = [
@@ -114,6 +120,14 @@ def _ensure_tab(spreadsheet, tab_name: str, headers: list):
         ws = spreadsheet.add_worksheet(title=tab_name, rows=10000, cols=len(headers))
         ws.append_row(headers, value_input_option="RAW")
         log.info(f"  Created new tab: {tab_name}")
+
+    # Ensure header row is correct
+    existing = ws.row_values(1)
+    if existing != headers:
+        if existing:
+            ws.delete_rows(1)
+        ws.insert_row(headers, index=1, value_input_option="RAW")
+
     return ws
 
 
@@ -136,14 +150,15 @@ def log_signals_to_sheet(signals: list, run_ts: str):
                 round(s["close"], 2),
                 round(s["atr"], 4),
                 round(s["supertrend"], 2),
+                s.get("trend_bars", ""),
                 stop,
                 target,
                 round(s["close"] - stop, 2),
             ])
         ws.append_rows(rows, value_input_option="RAW")
-        log.info(f"  ✓ {len(rows)} signals → '{GSHEET_NAME}' / {SIGNALS_TAB}")
+        log.info(f"  Logged {len(rows)} signals to '{GSHEET_NAME}' / {SIGNALS_TAB}")
     except Exception as e:
-        log.error(f"  ✗ Failed to log signals to Google Sheets: {e}")
+        log.error(f"  Failed to log signals: {e}")
 
 
 def log_orders_to_sheet(orders: list, run_ts: str):
@@ -168,61 +183,86 @@ def log_orders_to_sheet(orders: list, run_ts: str):
                 o.get("status", ""),
             ])
         ws.append_rows(rows, value_input_option="RAW")
-        log.info(f"  ✓ {len(rows)} orders → '{GSHEET_NAME}' / {ORDERS_TAB}")
+        log.info(f"  Logged {len(rows)} orders to '{GSHEET_NAME}' / {ORDERS_TAB}")
     except Exception as e:
-        log.error(f"  ✗ Failed to log orders to Google Sheets: {e}")
+        log.error(f"  Failed to log orders: {e}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 # 1. UNIVERSE
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 
-def get_sp500_tickers() -> list:
+def _scrape_sp500() -> list:
     try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-        return tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; screener/1.0)"}
+        r = requests.get(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+            headers=headers, timeout=15,
+        )
+        r.raise_for_status()
+        tickers = pd.read_html(r.text)[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
+        log.info(f"  S&P 500: {len(tickers)} tickers")
+        return tickers
     except Exception as e:
-        log.warning(f"Could not fetch S&P 500: {e}")
-        return []
+        log.warning(f"  S&P 500 scrape failed: {e}")
+    return []
 
 
-def get_nasdaq100_tickers() -> list:
+def _scrape_nasdaq100() -> list:
     try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")
-        for col in ["Ticker", "Symbol", "Tick"]:
-            for tbl in tables:
-                if col in tbl.columns:
-                    return tbl[col].tolist()
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; screener/1.0)"}
+        r = requests.get(
+            "https://en.wikipedia.org/wiki/Nasdaq-100",
+            headers=headers, timeout=15,
+        )
+        r.raise_for_status()
+        for table in pd.read_html(r.text):
+            for col in ("Ticker", "Symbol", "Ticker symbol"):
+                if col in table.columns:
+                    tickers = (table[col].astype(str).str.strip()
+                               .str.replace(r"\[.*?\]", "", regex=True).tolist())
+                    tickers = [t for t in tickers if t and t.lower() != "nan"]
+                    if len(tickers) > 50:
+                        log.info(f"  Nasdaq-100: {len(tickers)} tickers")
+                        return tickers
     except Exception as e:
-        log.warning(f"Could not fetch NASDAQ-100: {e}")
+        log.warning(f"  Nasdaq-100 scrape failed: {e}")
     return []
 
 
 def get_universe(max_tickers: int = 500) -> list:
-    log.info("Fetching ticker universe …")
-    sp500    = get_sp500_tickers()
-    ndq100   = get_nasdaq100_tickers()
+    log.info("Building ticker universe ...")
+    sp500  = _scrape_sp500()
+    ndq100 = _scrape_nasdaq100()
     combined = list(dict.fromkeys(sp500 + ndq100))
+
     if not combined:
-        log.warning("Scraping failed — using fallback 30 large-caps")
+        log.warning("All scrapes failed -- using hardcoded fallback")
         combined = [
-            "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","BRK-B","JPM","UNH",
-            "V","XOM","JNJ","PG","MA","HD","CVX","MRK","ABBV","PEP","COST","ADBE",
-            "AVGO","CRM","AMD","QCOM","TXN","NEE","RTX","LIN",
+            "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","TSLA","BRK-B","JPM",
+            "LLY","V","UNH","XOM","MA","JNJ","PG","AVGO","HD","MRK","COST","ABBV",
+            "CVX","WMT","BAC","NFLX","KO","PEP","ADBE","CRM","TMO","ACN","MCD",
+            "CSCO","ABT","LIN","DHR","TXN","NEE","PM","NKE","MS","WFC","INTC",
+            "IBM","RTX","INTU","AMGN","GS","CAT","SPGI","BLK","ISRG","ELV","SYK",
+            "MDT","AXP","T","GILD","ADI","VRTX","PLD","REGN","C","MMC","CB",
+            "MDLZ","MO","ZTS","SO","ETN","BSX","ADP","TJX","CI","DE","LRCX",
+            "EOG","PGR","BDX","CME","SLB","AON","ITW","NOC","APD","FI","HUM",
+            "MCO","EW","MPC","PSA","WM","DUK","NSC","KLAC","FCX","EMR","USB","GE",
         ]
+
     universe = combined[:max_tickers]
-    log.info(f"Universe: {len(universe)} tickers ({len(sp500)} S&P, {len(ndq100)} NDQ100)")
+    log.info(f"Universe: {len(universe)} tickers")
     return universe
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 # 2. DATA
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 
 def fetch_ohlcv(tickers: list, lookback_days: int = LOOKBACK_DAYS) -> dict:
     end   = datetime.today()
     start = end - timedelta(days=lookback_days)
-    log.info(f"Downloading {len(tickers)} tickers ({start.date()} → {end.date()}) …")
+    log.info(f"Downloading {len(tickers)} tickers ({start.date()} to {end.date()}) ...")
 
     raw = yf.download(
         tickers,
@@ -238,12 +278,21 @@ def fetch_ohlcv(tickers: list, lookback_days: int = LOOKBACK_DAYS) -> dict:
 
     for ticker in tickers:
         try:
-            df = raw.xs(ticker, axis=1, level=1).copy() if isinstance(raw.columns, pd.MultiIndex) else raw.copy()
+            if isinstance(raw.columns, pd.MultiIndex):
+                df = raw.xs(ticker, axis=1, level=1).copy()
+            else:
+                df = raw.copy()
+
             df.columns = [c.lower() for c in df.columns]
             df = df.dropna(subset=["close", "high", "low", "volume"])
-            if len(df) < min_bars:                      continue
-            if df["close"].iloc[-1] < MIN_STOCK_PRICE:  continue
-            if df["volume"].mean() < MIN_AVG_VOLUME:     continue
+
+            if len(df) < min_bars:
+                continue
+            if df["close"].iloc[-1] < MIN_STOCK_PRICE:
+                continue
+            if df["volume"].mean() < MIN_AVG_VOLUME:
+                continue
+
             result[ticker] = df.reset_index()
         except Exception:
             continue
@@ -252,9 +301,9 @@ def fetch_ohlcv(tickers: list, lookback_days: int = LOOKBACK_DAYS) -> dict:
     return result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 # 3. SUPERTREND
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 
 def compute_supertrend(df: pd.DataFrame) -> pd.DataFrame:
     df   = df.copy()
@@ -282,11 +331,19 @@ def compute_supertrend(df: pd.DataFrame) -> pd.DataFrame:
         upper[i] = upper[i] if upper[i] < upper[i-1] or close_v[i-1] > upper[i-1] else upper[i-1]
         lower[i] = lower[i] if lower[i] > lower[i-1] or close_v[i-1] < lower[i-1] else lower[i-1]
         if trend[i-1] == -1:
-            if close_v[i] > upper[i-1]: trend[i] = 1;  supertrend[i] = lower[i]
-            else:                        trend[i] = -1; supertrend[i] = upper[i]
+            if close_v[i] > upper[i-1]:
+                trend[i] = 1
+                supertrend[i] = lower[i]
+            else:
+                trend[i] = -1
+                supertrend[i] = upper[i]
         else:
-            if close_v[i] < lower[i-1]: trend[i] = -1; supertrend[i] = upper[i]
-            else:                        trend[i] = 1;  supertrend[i] = lower[i]
+            if close_v[i] < lower[i-1]:
+                trend[i] = -1
+                supertrend[i] = upper[i]
+            else:
+                trend[i] = 1
+                supertrend[i] = lower[i]
 
     df["supertrend"] = supertrend
     df["trend"]      = trend
@@ -294,22 +351,49 @@ def compute_supertrend(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def get_signal(df: pd.DataFrame) -> Optional[dict]:
+    """
+    Signal: latest bar is in Supertrend UPTREND (trend == 1).
+    Also requires volume above 20-day average for confirmation.
+    Returns the signal dict or None.
+    """
     df = compute_supertrend(df)
-    df["vol_ok"] = df["volume"] > df["volume"].rolling(VOL_MA_PERIOD).mean()
-    last, prev   = df.iloc[-1], df.iloc[-2]
-    if last["trend"] == 1 and prev["trend"] == -1 and bool(last["vol_ok"]):
-        return {
-            "close"      : float(last["close"]),
-            "atr"        : float(last["atr"]),
-            "supertrend" : float(last["supertrend"]),
-            "date"       : str(last.get("Date", last.get("date", ""))),
-        }
-    return None
+
+    # Volume confirmation
+    df["vol_ma"] = df["volume"].rolling(VOL_MA_PERIOD).mean()
+    last = df.iloc[-1]
+
+    # Skip if volume is below average (weak move)
+    if last["volume"] < last["vol_ma"]:
+        return None
+
+    # Signal: currently in uptrend
+    if last["trend"] != 1:
+        return None
+
+    # Count how many consecutive bars have been in uptrend (freshness indicator)
+    trend_bars = 0
+    for i in range(len(df) - 1, -1, -1):
+        if df.iloc[i]["trend"] == 1:
+            trend_bars += 1
+        else:
+            break
+
+    date_val = last.get("Date", last.get("date", ""))
+    if hasattr(date_val, "strftime"):
+        date_val = date_val.strftime("%Y-%m-%d")
+
+    return {
+        "close"      : float(last["close"]),
+        "atr"        : float(last["atr"]),
+        "supertrend" : float(last["supertrend"]),
+        "trend_bars" : trend_bars,   # 1 = fresh flip, higher = longer uptrend
+        "date"       : str(date_val),
+    }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 # 4. ALPACA
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 
 def get_alpaca_client():
     return tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version="v2")
@@ -335,10 +419,13 @@ def place_bracket_order(api, ticker: str, signal: dict, equity: float) -> Option
     shares = calculate_position_size(equity, entry, stop)
 
     if shares == 0 or shares * entry < 1.0:
-        log.warning(f"  {ticker}: skipping — position size too small")
+        log.warning(f"  {ticker}: skipping -- position size too small")
         return None
 
-    log.info(f"  ORDER → {ticker}  qty={shares}  entry≈${entry:.2f}  stop=${stop:.2f}  target=${target:.2f}  risk=${risk*shares:.0f}")
+    log.info(
+        f"  ORDER -> {ticker}  qty={shares}  entry~${entry:.2f}  "
+        f"stop=${stop:.2f}  target=${target:.2f}  risk=${risk*shares:.0f}"
+    )
 
     try:
         order = api.submit_order(
@@ -361,23 +448,24 @@ def place_bracket_order(api, ticker: str, signal: dict, equity: float) -> Option
             "status"  : order.status,
         }
     except Exception as e:
-        log.error(f"  {ticker}: order failed — {e}")
+        log.error(f"  {ticker}: order failed -- {e}")
         return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 # 5. MAIN
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 
 def run_screener(dry_run: bool = False, max_new_orders: int = 5):
     run_ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
     log.info("=" * 60)
-    log.info("  SUPERTREND SCREENER — ALPACA PAPER TRADING")
+    log.info("  SUPERTREND SCREENER -- ALPACA PAPER TRADING")
     log.info(f"  Run: {run_ts}")
+    log.info(f"  Mode: in uptrend today (any duration)")
     log.info("=" * 60)
 
-    # ── Alpaca ────────────────────────────────────────────────────
+    # Alpaca connection
     if not dry_run:
         try:
             api    = get_alpaca_client()
@@ -387,18 +475,18 @@ def run_screener(dry_run: bool = False, max_new_orders: int = 5):
             log.error(f"Cannot connect to Alpaca: {e}")
             return
     else:
-        log.info("DRY RUN — no orders will be placed")
+        log.info("DRY RUN -- no orders will be placed")
         api    = None
         equity = 100_000
 
-    # ── Data ──────────────────────────────────────────────────────
+    # Universe + data
     tickers = get_universe(max_tickers=500)
     data    = fetch_ohlcv(tickers)
     if not data:
         log.error("No data downloaded. Exiting.")
         return
 
-    # ── Positions / slots ─────────────────────────────────────────
+    # Open positions
     open_positions  = get_open_positions(api) if (api and not dry_run) else set()
     available_slots = MAX_OPEN_POSITIONS - len(open_positions)
     log.info(f"Open positions: {len(open_positions)}  Available slots: {available_slots}")
@@ -407,8 +495,8 @@ def run_screener(dry_run: bool = False, max_new_orders: int = 5):
         log.info("Max open positions reached. No new orders.")
         return
 
-    # ── Screen ────────────────────────────────────────────────────
-    log.info(f"Scanning {len(data)} tickers for Supertrend buy signals …")
+    # Screen
+    log.info(f"Scanning {len(data)} tickers for Supertrend uptrend signals ...")
     signals_found = []
     for ticker, df in data.items():
         if ticker in open_positions:
@@ -420,52 +508,62 @@ def run_screener(dry_run: bool = False, max_new_orders: int = 5):
 
     log.info(f"Signals found: {len(signals_found)}")
 
-    if signals_found:
-        sig_df = pd.DataFrame(signals_found)[["ticker", "date", "close", "atr", "supertrend"]]
-        sig_df["stop"]   = (sig_df["close"] - STOP_LOSS_ATR_MULT * sig_df["atr"]).round(2)
-        sig_df["target"] = (sig_df["close"] + (sig_df["close"] - sig_df["stop"]) * TAKE_PROFIT_RATIO).round(2)
-        sig_df["close"]  = sig_df["close"].round(2)
-        sig_df["atr"]    = sig_df["atr"].round(3)
-        print("\n" + sig_df.to_string(index=False) + "\n")
+    if not signals_found:
+        log.warning("No uptrend signals found -- check data or filters")
+        return
 
-    # ── Log signals → Google Sheets ───────────────────────────────
-    log.info("Logging signals to Google Sheets …")
+    # Sort: prefer fresher flips (lower trend_bars) then by close price momentum
+    signals_found.sort(key=lambda x: x["trend_bars"])
+
+    # Print summary table
+    sig_df = pd.DataFrame(signals_found)
+    sig_df["stop"]   = (sig_df["close"] - STOP_LOSS_ATR_MULT * sig_df["atr"]).round(2)
+    sig_df["target"] = (sig_df["close"] + (sig_df["close"] - sig_df["stop"]) * TAKE_PROFIT_RATIO).round(2)
+    sig_df["close"]  = sig_df["close"].round(2)
+    sig_df["atr"]    = sig_df["atr"].round(3)
+    display_cols = ["ticker", "date", "trend_bars", "close", "atr", "supertrend", "stop", "target"]
+    print("\n" + sig_df[display_cols].head(20).to_string(index=False) + "\n")
+
+    # Log signals to Google Sheets
+    log.info("Logging signals to Google Sheets ...")
     log_signals_to_sheet(signals_found, run_ts)
 
-    # ── Place orders ──────────────────────────────────────────────
+    # Place orders (top signals by freshness)
     orders_placed = []
     limit = min(available_slots, max_new_orders, len(signals_found))
 
     for sig in signals_found[:limit]:
         ticker = sig["ticker"]
         if dry_run:
-            log.info(f"  [DRY RUN] Would order {ticker} @ ${sig['close']:.2f}")
+            log.info(f"  [DRY RUN] Would order {ticker} @ ${sig['close']:.2f}  trend_bars={sig['trend_bars']}")
         else:
             result = place_bracket_order(api, ticker, sig, equity)
             if result:
                 orders_placed.append(result)
             time.sleep(0.3)
 
-    # ── Log orders → Google Sheets ────────────────────────────────
-    log.info("Logging orders to Google Sheets …")
+    # Log orders to Google Sheets
+    log.info("Logging orders to Google Sheets ...")
     log_orders_to_sheet(orders_placed, run_ts)
 
-    # ── Summary ───────────────────────────────────────────────────
     log.info("=" * 60)
-    log.info(f"  Signals: {len(signals_found)}  Orders placed: {len(orders_placed)}")
+    log.info(f"  Tickers scanned : {len(data)}")
+    log.info(f"  Signals found   : {len(signals_found)}")
+    log.info(f"  Orders placed   : {len(orders_placed)}")
     log.info("=" * 60)
 
     return {"signals": signals_found, "orders": orders_placed}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
+# ENTRY POINT
+# ===========================================================================
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Supertrend screener + Alpaca paper trading")
     parser.add_argument("--dry-run",    action="store_true", help="Print signals only, no orders")
-    parser.add_argument("--max-orders", type=int, default=5, help="Max new orders per run (default 5)")
+    parser.add_argument("--max-orders", type=int, default=5,  help="Max new orders per run (default 5)")
     args = parser.parse_args()
     run_screener(dry_run=args.dry_run, max_new_orders=args.max_orders)
+
