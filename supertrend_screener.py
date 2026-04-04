@@ -19,6 +19,7 @@ GitHub Actions secrets required:
 """
 
 import os
+from config_loader import cfg
 import time
 import tempfile
 import logging
@@ -46,9 +47,9 @@ except ImportError:
 # CONFIG
 # ===========================================================================
 
-ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY",    "")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
-ALPACA_BASE_URL   = os.getenv("ALPACA_BASE_URL",   "https://paper-api.alpaca.markets")
+ALPACA_API_KEY    = cfg.get("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY = cfg.get("ALPACA_SECRET_KEY", "")
+ALPACA_BASE_URL   = cfg.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
 # Google Sheets
 GSHEET_NAME  = "ranging"
@@ -103,7 +104,7 @@ ORDERS_HEADERS = [
 
 
 def _gsheet_client():
-    raw = os.environ.get("GSPREAD_SA_KEY_JSON")
+    raw = cfg.get("GSPREAD_SA_KEY_JSON")
     if not raw:
         raise EnvironmentError("GSPREAD_SA_KEY_JSON env var not set")
     tf = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
@@ -433,7 +434,7 @@ def place_bracket_order(api, ticker: str, signal: dict, equity: float) -> Option
             qty           = shares,
             side          = "buy",
             type          = "market",
-            time_in_force = "day",
+            time_in_force = "gtc",
             order_class   = "bracket",
             stop_loss     = {"stop_price": str(stop)},
             take_profit   = {"limit_price": str(target)},
@@ -566,4 +567,3 @@ if __name__ == "__main__":
     parser.add_argument("--max-orders", type=int, default=5,  help="Max new orders per run (default 5)")
     args = parser.parse_args()
     run_screener(dry_run=args.dry_run, max_new_orders=args.max_orders)
-
