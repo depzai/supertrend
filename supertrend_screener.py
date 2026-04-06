@@ -63,6 +63,7 @@ VOL_MA_PERIOD = 20
 
 # Risk management
 RISK_PER_TRADE_PCT = 0.01
+MAX_TRADE_USD      = 2000   # hard cap -- never more than $2000 per trade
 STOP_LOSS_ATR_MULT = 1.5
 TAKE_PROFIT_RATIO  = 2.0
 MAX_OPEN_POSITIONS = 10
@@ -408,7 +409,10 @@ def calculate_position_size(equity: float, entry: float, stop: float) -> int:
     risk_per_share = entry - stop
     if risk_per_share <= 0:
         return 0
-    return max(int((equity * RISK_PER_TRADE_PCT) / risk_per_share), 1)
+    shares = max(int((equity * RISK_PER_TRADE_PCT) / risk_per_share), 1)
+    # Hard cap: never exceed MAX_TRADE_USD per trade
+    max_shares = int(MAX_TRADE_USD / entry) if entry > 0 else shares
+    return min(shares, max_shares)
 
 
 def place_bracket_order(api, ticker: str, signal: dict, equity: float) -> Optional[dict]:
@@ -567,3 +571,4 @@ if __name__ == "__main__":
     parser.add_argument("--max-orders", type=int, default=5,  help="Max new orders per run (default 5)")
     args = parser.parse_args()
     run_screener(dry_run=args.dry_run, max_new_orders=args.max_orders)
+
