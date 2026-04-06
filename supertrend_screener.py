@@ -19,7 +19,6 @@ GitHub Actions secrets required:
 """
 
 import os
-from config_loader import cfg
 import time
 import tempfile
 import logging
@@ -47,9 +46,9 @@ except ImportError:
 # CONFIG
 # ===========================================================================
 
-ALPACA_API_KEY    = cfg.get("ALPACA_API_KEY", "")
-ALPACA_SECRET_KEY = cfg.get("ALPACA_SECRET_KEY", "")
-ALPACA_BASE_URL   = cfg.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY",    "")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
+ALPACA_BASE_URL   = os.getenv("ALPACA_BASE_URL",   "https://paper-api.alpaca.markets")
 
 # Google Sheets
 GSHEET_NAME  = "ranging"
@@ -105,7 +104,7 @@ ORDERS_HEADERS = [
 
 
 def _gsheet_client():
-    raw = cfg.get("GSPREAD_SA_KEY_JSON")
+    raw = os.environ.get("GSPREAD_SA_KEY_JSON")
     if not raw:
         raise EnvironmentError("GSPREAD_SA_KEY_JSON env var not set")
     tf = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
